@@ -1,11 +1,12 @@
 #include <memory>
 #include <thread>
-#include <cmath> // 수학 계산용 (sqrt, pow)
+#include <cmath>
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "turtlesim/msg/pose.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "my_first_package_msgs/action/dist_turtle.hpp"
+#include "rcl_interfaces/msg/set_parameters_result.hpp" // 파라미터 결과용 헤더
 
 class DistTurtleServer : public rclcpp::Node {
 public:
@@ -13,26 +14,41 @@ public:
   using GoalHandleDistTurtle = rclcpp_action::ServerGoalHandle<DistTurtle>;
 
   DistTurtleServer() : Node("dist_turtle_action_server") {
-    // 거북이에게 속도 명령을 내릴 Publisher
     publisher_ = this->create_publisher<geometry_msgs::msg::Twist>("/turtle1/cmd_vel", 10);
-    
-    // 거북이의 현재 위치를 받아올 Subscriber
     subscriber_ = this->create_subscription<turtlesim::msg::Pose>(
       "/turtle1/pose", 10, std::bind(&DistTurtleServer::pose_callback, this, std::placeholders::_1));
 
-    // 액션 서버 설정
+    // 1. 파라미터 선언 (기본값 설정)
+    this->declare_parameter("quantile_time", 0.75);
+    this->get_parameter("quantile_time", quantile_time_);
+
+    // 파라미터 변경 시 호출될 콜백 등록
+    parameter_callback_handle_ = this->add_on_set_parameters_callback(
+      std::bind(&DistTurtleServer::parameter_callback, this, std::placeholders::_1));
+
     this->action_server_ = rclcpp_action::create_server<DistTurtle>(
       this, "dist_turtle",
       std::bind(&DistTurtleServer::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
       std::bind(&DistTurtleServer::handle_cancel, this, std::placeholders::_1),
       std::bind(&DistTurtleServer::handle_accepted, this, std::placeholders::_1));
 
-    RCLCPP_INFO(this->get_logger(), "Step 3: Action Server with Logic is ready.");
+    RCLCPP_INFO(this->get_logger(), "Step 4: Action Server with Parameters is ready.");
   }
 
 private:
-  // 이전 위치와 현재 위치 사이의 거리를 계산하는 함수
-  // 유클리드 거리 공식: $d = \sqrt{(x_2 - x_1)^2 + (y_2 - y_1)^2}$
+  // 파라미터 변경 처리 함수
+  rcl_interfaces::msg::SetParametersResult parameter_callback(const std::vector<rclcpp::Parameter> &params) {
+    auto result = rcl_interfaces::msg::SetParametersResult();
+    result.successful = true;
+    for (const auto &param : params) {
+      if (param.get_name() == "quantile_time") {
+        quantile_time_ = param.as_double();
+        RCLCPP_INFO(this->get_logger(), "Parameter 'quantile_time' changed to: %.2f", quantile_time_);
+      }
+    }
+    return result;
+  }
+
   double calc_diff_pose() {
     if (is_first_time_) {
       previous_pose_ = current_pose_;
@@ -44,63 +60,57 @@ private:
     return diff;
   }
 
-  // 액션의 핵심 로직이 돌아가는 함수
   void execute(const std::shared_ptr<GoalHandleDistTurtle> goal_handle) {
-    RCLCPP_INFO(this->get_logger(), "Execution started!");
     const auto goal = goal_handle->get_goal();
     auto feedback = std::make_shared<DistTurtle::Feedback>();
     auto result = std::make_shared<DistTurtle::Result>();
     geometry_msgs::msg::Twist msg;
 
-    // 목표 거리에 도달할 때까지 반복
     while (rclcpp::ok()) {
       total_dist_ += calc_diff_pose();
       feedback->remained_dist = goal->dist - total_dist_;
       goal_handle->publish_feedback(feedback);
 
-      // 로봇 이동 명령
+      // 중간 지점 알림 로직 (파이썬의 tmp < 0.02 부분)
+      double target_point = goal->dist * quantile_time_;
+      if (std::abs(total_dist_ - target_point) < 0.05) {
+        RCLCPP_INFO(this->get_logger(), "The turtle passes the %.2f point!", quantile_time_);
+      }
+
       msg.linear.x = goal->linear_x;
       msg.angular.z = goal->angular_z;
       publisher_->publish(msg);
 
-      // 남은 거리가 0.2미만이면 목표 도착으로 간주
-      if (feedback->remained_dist < 0.2) break; 
-      
+      if (feedback->remained_dist < 0.2) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    // 최종 결과 반환 및 변수 초기화
+    // 2. 결과 데이터 상세화 (좌표 추가)
+    result->pos_x = current_pose_.x;
+    result->pos_y = current_pose_.y;
+    result->pos_theta = current_pose_.theta;
     result->result_dist = total_dist_;
-    total_dist_ = 0.0; 
+
+    total_dist_ = 0.0;
     is_first_time_ = true;
     goal_handle->succeed(result);
-    RCLCPP_INFO(this->get_logger(), "Goal reached and succeeded!");
+    RCLCPP_INFO(this->get_logger(), "Goal Reached! Final Pos: (%.2f, %.2f)", result->pos_x, result->pos_y);
   }
 
-  // 핸들러 함수들
-  rclcpp_action::GoalResponse handle_goal(const rclcpp_action::GoalUUID &, std::shared_ptr<const DistTurtle::Goal>) {
-    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
-  }
-  
-  rclcpp_action::CancelResponse handle_cancel(const std::shared_ptr<GoalHandleDistTurtle>) {
-    return rclcpp_action::CancelResponse::ACCEPT;
-  }
-  
-  void handle_accepted(const std::shared_ptr<GoalHandleDistTurtle> goal_handle) {
-    // 멀티스레드를 사용하여 execute 함수 실행 (노드 스핀과 분리)
-    std::thread{std::bind(&DistTurtleServer::execute, this, goal_handle)}.detach();
-  }
-  
-  void pose_callback(const turtlesim::msg::Pose::SharedPtr msg) { 
-    current_pose_ = *msg; 
-  }
+  // 핸들러 및 기타 함수들 (동일)
+  rclcpp_action::GoalResponse handle_goal(const rclcpp_action::GoalUUID &, std::shared_ptr<const DistTurtle::Goal>) { return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE; }
+  rclcpp_action::CancelResponse handle_cancel(const std::shared_ptr<GoalHandleDistTurtle>) { return rclcpp_action::CancelResponse::ACCEPT; }
+  void handle_accepted(const std::shared_ptr<GoalHandleDistTurtle> goal_handle) { std::thread{std::bind(&DistTurtleServer::execute, this, goal_handle)}.detach(); }
+  void pose_callback(const turtlesim::msg::Pose::SharedPtr msg) { current_pose_ = *msg; }
 
   double total_dist_ = 0.0;
+  double quantile_time_ = 0.75; // 파라미터 변수
   bool is_first_time_ = true;
   turtlesim::msg::Pose current_pose_, previous_pose_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr publisher_;
   rclcpp::Subscription<turtlesim::msg::Pose>::SharedPtr subscriber_;
   rclcpp_action::Server<DistTurtle>::SharedPtr action_server_;
+  OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_; // 파라미터 핸들러
 };
 
 int main(int argc, char **argv) {
