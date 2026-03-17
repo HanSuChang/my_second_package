@@ -5,8 +5,8 @@
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "turtlesim/msg/pose.hpp"
 #include "geometry_msgs/msg/twist.hpp"
+#include "turtlesim/srv/teleport_absolute.hpp"
 #include "my_first_package_msgs/action/dist_turtle.hpp"
-#include "rcl_interfaces/msg/set_parameters_result.hpp" // 파라미터 결과용 헤더
 
 class DistTurtleServer : public rclcpp::Node {
 public:
@@ -17,106 +17,111 @@ public:
     publisher_ = this->create_publisher<geometry_msgs::msg::Twist>("/turtle1/cmd_vel", 10);
     subscriber_ = this->create_subscription<turtlesim::msg::Pose>(
       "/turtle1/pose", 10, std::bind(&DistTurtleServer::pose_callback, this, std::placeholders::_1));
-
-    // 1. 파라미터 선언 (기본값 설정)
-    this->declare_parameter("quantile_time", 0.75);
-    this->get_parameter("quantile_time", quantile_time_);
-
-    // 파라미터 변경 시 호출될 콜백 등록
-    parameter_callback_handle_ = this->add_on_set_parameters_callback(
-      std::bind(&DistTurtleServer::parameter_callback, this, std::placeholders::_1));
-
+    teleport_client_ = this->create_client<turtlesim::srv::TeleportAbsolute>("/turtle1/teleport_absolute");
+    
     this->action_server_ = rclcpp_action::create_server<DistTurtle>(
       this, "dist_turtle",
       std::bind(&DistTurtleServer::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
       std::bind(&DistTurtleServer::handle_cancel, this, std::placeholders::_1),
       std::bind(&DistTurtleServer::handle_accepted, this, std::placeholders::_1));
-
-    RCLCPP_INFO(this->get_logger(), "Step 4: Action Server with Parameters is ready.");
+    RCLCPP_INFO(this->get_logger(), "Wall-E Turtle Server is ready!");
   }
 
 private:
-  // 파라미터 변경 처리 함수
-  rcl_interfaces::msg::SetParametersResult parameter_callback(const std::vector<rclcpp::Parameter> &params) {
-    auto result = rcl_interfaces::msg::SetParametersResult();
-    result.successful = true;
-    for (const auto &param : params) {
-      if (param.get_name() == "quantile_time") {
-        quantile_time_ = param.as_double();
-        RCLCPP_INFO(this->get_logger(), "Parameter 'quantile_time' changed to: %.2f", quantile_time_);
-      }
-    }
-    return result;
-  }
-
-  double calc_diff_pose() {
-    if (is_first_time_) {
-      previous_pose_ = current_pose_;
-      is_first_time_ = false;
-    }
-    double diff = std::sqrt(std::pow(current_pose_.x - previous_pose_.x, 2) + 
-                            std::pow(current_pose_.y - previous_pose_.y, 2));
-    previous_pose_ = current_pose_;
-    return diff;
-  }
-
-  void execute(const std::shared_ptr<GoalHandleDistTurtle> goal_handle) {
-    const auto goal = goal_handle->get_goal();
-    auto feedback = std::make_shared<DistTurtle::Feedback>();
-    auto result = std::make_shared<DistTurtle::Result>();
+  // 1. 특정 방향(Theta)으로 정밀 회전
+  void rotate_to_theta(double target_theta) {
     geometry_msgs::msg::Twist msg;
-
+    const double Kp = 4.0;
     while (rclcpp::ok()) {
-      total_dist_ += calc_diff_pose();
-      feedback->remained_dist = goal->dist - total_dist_;
-      goal_handle->publish_feedback(feedback);
+      double error = target_theta - current_pose_.theta;
+      // 각도 차이 최적화 (-PI ~ PI)
+      while (error > M_PI) error -= 2 * M_PI;
+      while (error < -M_PI) error += 2 * M_PI;
 
-      // 중간 지점 알림 로직 (파이썬의 tmp < 0.02 부분)
-      double target_point = goal->dist * quantile_time_;
-      if (std::abs(total_dist_ - target_point) < 0.05) {
-        RCLCPP_INFO(this->get_logger(), "The turtle passes the %.2f point!", quantile_time_);
-      }
+      if (std::abs(error) < 0.005) break;
 
-      msg.linear.x = goal->linear_x;
-      msg.angular.z = goal->angular_z;
+      msg.angular.z = Kp * error;
       publisher_->publish(msg);
-
-      if (feedback->remained_dist < 0.2) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-
-    // 2. 결과 데이터 상세화 (좌표 추가)
-    result->pos_x = current_pose_.x;
-    result->pos_y = current_pose_.y;
-    result->pos_theta = current_pose_.theta;
-    result->result_dist = total_dist_;
-
-    total_dist_ = 0.0;
-    is_first_time_ = true;
-    goal_handle->succeed(result);
-    RCLCPP_INFO(this->get_logger(), "Goal Reached! Final Pos: (%.2f, %.2f)", result->pos_x, result->pos_y);
+    stop_turtle();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
 
-  // 핸들러 및 기타 함수들 (동일)
+  // 2. 조건 만족할 때까지 전진 (벽 감지 또는 좌표 도달)
+  void move_until(std::function<bool()> condition, double linear_v) {
+    geometry_msgs::msg::Twist msg;
+    msg.linear.x = linear_v;
+    while (rclcpp::ok() && !condition()) {
+      publisher_->publish(msg);
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    stop_turtle();
+  }
+
+  void stop_turtle() { geometry_msgs::msg::Twist msg; publisher_->publish(msg); }
+  void pose_callback(const turtlesim::msg::Pose::SharedPtr msg) { current_pose_ = *msg; }
+
+  void execute(const std::shared_ptr<GoalHandleDistTurtle> goal_handle) {
+    // [0] 시작 위치 강제 초기화 및 저장
+    auto request = std::make_shared<turtlesim::srv::TeleportAbsolute::Request>();
+    request->x = 5.5; request->y = 5.5; request->theta = 0.0;
+    teleport_client_->async_send_request(request);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    double start_x = current_pose_.x;
+    double start_y = current_pose_.y;
+    RCLCPP_INFO(this->get_logger(), "Home set to: (%.2f, %.2f)", start_x, start_y);
+
+    // [1] 오른쪽 벽까지
+    RCLCPP_INFO(this->get_logger(), "Step 1: To the Right Wall");
+    rotate_to_theta(0.0);
+    move_until([this]() { return current_pose_.x > 10.5; }, 2.0);
+
+    // [2] 천장까지
+    RCLCPP_INFO(this->get_logger(), "Step 2: To the Ceiling");
+    rotate_to_theta(M_PI / 2.0);
+    move_until([this]() { return current_pose_.y > 10.5; }, 2.0);
+
+    // [3] 왼쪽 벽까지
+    RCLCPP_INFO(this->get_logger(), "Step 3: To the Left Wall");
+    rotate_to_theta(M_PI);
+    move_until([this]() { return current_pose_.x < 0.5; }, 2.0);
+
+    // [4] 바닥까지
+    RCLCPP_INFO(this->get_logger(), "Step 4: To the Floor");
+    rotate_to_theta(-M_PI / 2.0);
+    move_until([this]() { return current_pose_.y < 0.5; }, 2.0);
+
+    // [5] 시작 X좌표까지 (오른쪽으로 꺾기)
+    RCLCPP_INFO(this->get_logger(), "Step 5: Returning to Start X Line");
+    rotate_to_theta(0.0);
+    move_until([this, start_x]() { return current_pose_.x >= start_x; }, 2.0);
+
+    // [6] 시작 Y좌표까지 (위로 꺾기)
+    RCLCPP_INFO(this->get_logger(), "Step 6: Returning Home (Start Y)");
+    rotate_to_theta(M_PI / 2.0);
+    move_until([this, start_y]() { return current_pose_.y >= start_y; }, 1.0);
+
+    RCLCPP_INFO(this->get_logger(), "I'm Back Home! Mission Success.");
+    goal_handle->succeed(std::make_shared<DistTurtle::Result>());
+  }
+
+  // 핸들러 및 멤버 변수
   rclcpp_action::GoalResponse handle_goal(const rclcpp_action::GoalUUID &, std::shared_ptr<const DistTurtle::Goal>) { return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE; }
   rclcpp_action::CancelResponse handle_cancel(const std::shared_ptr<GoalHandleDistTurtle>) { return rclcpp_action::CancelResponse::ACCEPT; }
   void handle_accepted(const std::shared_ptr<GoalHandleDistTurtle> goal_handle) { std::thread{std::bind(&DistTurtleServer::execute, this, goal_handle)}.detach(); }
-  void pose_callback(const turtlesim::msg::Pose::SharedPtr msg) { current_pose_ = *msg; }
 
-  double total_dist_ = 0.0;
-  double quantile_time_ = 0.75; // 파라미터 변수
-  bool is_first_time_ = true;
-  turtlesim::msg::Pose current_pose_, previous_pose_;
+  turtlesim::msg::Pose current_pose_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr publisher_;
   rclcpp::Subscription<turtlesim::msg::Pose>::SharedPtr subscriber_;
   rclcpp_action::Server<DistTurtle>::SharedPtr action_server_;
-  OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_; // 파라미터 핸들러
+  rclcpp::Client<turtlesim::srv::TeleportAbsolute>::SharedPtr teleport_client_;
 };
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<DistTurtleServer>();
-  rclcpp::spin(node);
+  rclcpp::spin(std::make_shared<DistTurtleServer>());
   rclcpp::shutdown();
   return 0;
 }
