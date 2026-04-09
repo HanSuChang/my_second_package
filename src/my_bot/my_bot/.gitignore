@@ -1,0 +1,12 @@
+# ROS 2 build folders
+build/
+install/
+log/
+
+# Python byte code
+__pycache__/
+*.pyc
+
+# Map files (무시하고 싶을 때만 #을 지우기)
+my_map.pgm
+my_map.yaml
